@@ -1,0 +1,126 @@
+-- Challenge 2 fixture for the synthetic overnight batch SLA report.
+-- Run once after creating the dedicated BOB_SQL_LAB schema.
+-- Expected counts: 100000 scheduled jobs and 136000 run attempts.
+
+CREATE TABLE BOB_SQL_LAB.BATCH_SCHEDULE (
+    BUSINESS_DATE DATE NOT NULL,
+    JOB_ID INTEGER NOT NULL,
+    JOB_NAME VARCHAR(32) NOT NULL,
+    DEADLINE_TS TIMESTAMP NOT NULL,
+    PRIMARY KEY (BUSINESS_DATE, JOB_ID)
+);
+
+CREATE TABLE BOB_SQL_LAB.BATCH_RUN (
+    BUSINESS_DATE DATE NOT NULL,
+    JOB_ID INTEGER NOT NULL,
+    ATTEMPT_NO SMALLINT NOT NULL,
+    RUN_STATUS VARCHAR(9) NOT NULL,
+    START_TS TIMESTAMP NOT NULL,
+    END_TS TIMESTAMP,
+    PRIMARY KEY (JOB_ID, BUSINESS_DATE, ATTEMPT_NO),
+    FOREIGN KEY (BUSINESS_DATE, JOB_ID)
+        REFERENCES BOB_SQL_LAB.BATCH_SCHEDULE (BUSINESS_DATE, JOB_ID),
+    CHECK (RUN_STATUS IN ('SUCCESS', 'FAILED', 'RUNNING', 'CANCELLED')),
+    CHECK (RUN_STATUS = 'RUNNING' OR END_TS IS NOT NULL),
+    CHECK (END_TS IS NULL OR END_TS >= START_TS)
+);
+
+INSERT INTO BOB_SQL_LAB.BATCH_SCHEDULE (BUSINESS_DATE, JOB_ID, JOB_NAME, DEADLINE_TS)
+WITH DIGIT (N) AS (
+    VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+), DATES (BUSINESS_DATE) AS (
+    SELECT DATE('2026-07-01') + (T.N * 10 + U.N) DAYS
+    FROM DIGIT T CROSS JOIN DIGIT U
+), JOBS (JOB_ID) AS (
+    SELECT H.N * 100 + T.N * 10 + U.N + 1
+    FROM DIGIT H CROSS JOIN DIGIT T CROSS JOIN DIGIT U
+)
+SELECT
+    D.BUSINESS_DATE,
+    J.JOB_ID,
+    'NIGHTLY_BATCH_' || DIGITS(DECIMAL(J.JOB_ID, 4, 0)),
+    CASE
+        WHEN MOD(J.JOB_ID, 100) = 14
+            THEN TIMESTAMP(D.BUSINESS_DATE + 1 DAY, TIME('01:30:00'))
+        ELSE TIMESTAMP(D.BUSINESS_DATE, TIME('04:00:00'))
+    END
+FROM DATES D CROSS JOIN JOBS J;
+
+-- Bucket zero has no attempts. The first jobs on 2026-10-01 expose the
+-- edge cases, and the mapping shifts across business dates.
+-- Bucket twelve has two successes at the same completion time.
+INSERT INTO BOB_SQL_LAB.BATCH_RUN (BUSINESS_DATE, JOB_ID, ATTEMPT_NO, RUN_STATUS, START_TS, END_TS)
+WITH SCHEDULE_CASES AS (
+    SELECT
+        BUSINESS_DATE,
+        JOB_ID,
+        DEADLINE_TS,
+        MOD(JOB_ID - 1 + DAYS(BUSINESS_DATE) - DAYS(DATE('2026-10-01')) + 100, 100) AS CASE_NO
+    FROM BOB_SQL_LAB.BATCH_SCHEDULE
+), ATTEMPT_NUMBERS (ATTEMPT_NO) AS (
+    VALUES (1), (2)
+), ATTEMPTS AS (
+    SELECT
+        S.BUSINESS_DATE,
+        S.JOB_ID,
+        S.DEADLINE_TS,
+        A.ATTEMPT_NO,
+        CASE
+            WHEN A.ATTEMPT_NO = 1 AND S.CASE_NO IN (2, 11) THEN 'RUNNING'
+            WHEN A.ATTEMPT_NO = 1 AND S.CASE_NO = 10 THEN 'CANCELLED'
+            WHEN A.ATTEMPT_NO = 1 AND (S.CASE_NO IN (1, 5, 6, 9) OR S.CASE_NO BETWEEN 40 AND 59)
+                THEN 'FAILED'
+            WHEN A.ATTEMPT_NO = 2 AND S.CASE_NO IN (8, 9, 11) THEN 'FAILED'
+            ELSE 'SUCCESS'
+        END AS RUN_STATUS,
+        CASE
+            WHEN A.ATTEMPT_NO = 1 THEN
+                CASE S.CASE_NO
+                    WHEN 3 THEN 1
+                    WHEN 4 THEN 0
+                    WHEN 7 THEN -12
+                    WHEN 8 THEN -12
+                    WHEN 12 THEN 5
+                    WHEN 13 THEN -1
+                    ELSE -25
+                END
+            ELSE
+                CASE S.CASE_NO
+                    WHEN 6 THEN 5
+                    WHEN 7 THEN 9
+                    WHEN 8 THEN 11
+                    WHEN 9 THEN -5
+                    WHEN 11 THEN -5
+                    WHEN 12 THEN 5
+                    ELSE -10
+                END
+        END AS END_OFFSET_MINUTES
+    FROM SCHEDULE_CASES S
+    CROSS JOIN ATTEMPT_NUMBERS A
+    WHERE S.CASE_NO <> 0
+        AND (
+            A.ATTEMPT_NO = 1
+            OR S.CASE_NO IN (5, 6, 7, 8, 9, 11, 12)
+            OR S.CASE_NO BETWEEN 40 AND 59
+            OR S.CASE_NO BETWEEN 70 AND 79
+        )
+), ATTEMPT_TIMES AS (
+    SELECT
+        BUSINESS_DATE,
+        JOB_ID,
+        ATTEMPT_NO,
+        RUN_STATUS,
+        DEADLINE_TS + END_OFFSET_MINUTES MINUTES AS ESTIMATED_END_TS
+    FROM ATTEMPTS
+)
+SELECT
+    BUSINESS_DATE,
+    JOB_ID,
+    ATTEMPT_NO,
+    RUN_STATUS,
+    ESTIMATED_END_TS - 5 MINUTES,
+    CASE WHEN RUN_STATUS <> 'RUNNING' THEN ESTIMATED_END_TS END
+FROM ATTEMPT_TIMES;
+
+CREATE INDEX BOB_SQL_LAB.BATCH_RUN_DATE_JOB_IX
+    ON BOB_SQL_LAB.BATCH_RUN (BUSINESS_DATE, JOB_ID, RUN_STATUS, END_TS);
